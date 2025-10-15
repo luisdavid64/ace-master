@@ -1,0 +1,43 @@
+class:: CGammatone
+summary:: Single complex gammatone filter
+related:: Classes/Gammatone,Classes/Meddis,Classes/HairCell
+categories:: UGens>Analysis, UGens>Filters
+
+Description::
+
+A bandpass filter, as used in auditory modeling; approximates the frequency selectivity of a haircell site on the basilar membrane in the cochlea.
+Same as Gammatone, with some differences: 1) additional imaginary output, 2) bandwidth is -4dB bandwidth.
+
+coded following:
+V Hohmann Frequency analysis and synthesis using a Gammatone filterbank Acta Acustica vol 88 (2002): 433--442
+
+classmethods::
+
+method::ar
+
+argument::input
+input sound to filter.
+argument::centrefrequency
+Centre frequency in Hz. Default value is 440.0. Cannot be modulated.
+argument::bandwidth
+Bandwidth of filter in Hz (here -4dB bandwidth). Default value is 200.0. Cannot be modulated.
+
+
+Examples::
+
+code::
+
+
+// real output
+{CGammatone.ar(WhiteNoise.ar)[0]}.play
+
+// imaginary output
+{CGammatone.ar(WhiteNoise.ar)[1]}.play
+
+
+// multichannel expansion leads to array of 2-channel (real, imag) signals
+
+
+
+
+::

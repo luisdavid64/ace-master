@@ -1,0 +1,3 @@
+/Users/luisreyes/Sonify/ace-master/sc/ACEUGens/build/CMakeFiles/ACEUGens.dir
+/Users/luisreyes/Sonify/ace-master/sc/ACEUGens/build/CMakeFiles/edit_cache.dir
+/Users/luisreyes/Sonify/ace-master/sc/ACEUGens/build/CMakeFiles/rebuild_cache.dir
