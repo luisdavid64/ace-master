@@ -1,0 +1,5 @@
+__pycache__
+dasp_ace/wav
+.DS_Store
+*.wav
+*.vscode

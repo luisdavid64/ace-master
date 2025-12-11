@@ -17,6 +17,17 @@ s = Server.local; // use local server
 ~loadfiles = {|targets| targets.do{ |target| (~path.pathOnly ++ ~path.fileNameWithoutExtension ++ "_" ++ target ++ ".scd").load } }; // function to load external files
 ~loadfiles.(\options); // set general server options and load presets
 ~setOptions.(s, \default); // set server options for specific audio interface as 2nd argument
+s.options.sampleRate = 44100;
+s.options.numInputBusChannels = 2;      // BlackHole requires 2
+s.options.numOutputBusChannels = 2;
+s.options.inDevice = "New Attempt";
+s.options.outDevice = "External Headphones";
+// Aggregate has 2 inputs (from BlackHole), 4 outputs total
+s.options.numInputBusChannels = 2;
+s.options.numOutputBusChannels = 2;   // we only *use* stereo
+
+s.options.sampleRate = 44100;
+
 s.reboot; // (re-)boot server
 )
 
@@ -34,8 +45,10 @@ g.interGUI = ~interGUI.(); // start inter-stimulus ACE GUI
 )
 
 
-
 // optional: control via MIDI
 ~startmidi.(); // start midi
 ~stopmidi.(); // stop midi
 
+
+Platform.userExtensionDir.postln;
+x = { SoundIn.ar(0) }.stop;
