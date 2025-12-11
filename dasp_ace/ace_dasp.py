@@ -3,6 +3,7 @@ Optimized ACE Implementation using DASP PyTorch - Version 2
 Focus on using actual DASP components and efficient processing
 """
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -10,6 +11,8 @@ import numpy as np
 from typing import Optional, Tuple, Dict, Any
 import dasp_pytorch.signal_dasp as dasp_signal
 import dasp_pytorch.functional as dasp_F
+from high_pass import DifferentiableHPF
+import torchaudio
 
 
 class OptimizedDASPACE(nn.Module):
@@ -77,22 +80,32 @@ class OptimizedDASPACE(nn.Module):
         
         # Band-specific gains (learnable per frequency band)
         self.band_gains = nn.Parameter(torch.ones(n_bands))     # band weights
+        self.hpf_module = DifferentiableHPF(sample_rate)
+
 
         
     """ Temporal Contrast Enhancement (TCE) Functions """
 
-    def _time_constant_to_alpha(self, tau_ms: torch.Tensor) -> torch.Tensor:
+    def _time_constant_to_alpha_T60(self, tau_ms: torch.Tensor) -> torch.Tensor:
         """
-        Convert time constant tau (in ms) to smoothing factor alpha (Eq. 10).
-        tau_ms: scalar tensor in milliseconds
+        Match SuperCollider's mapping:
+        logk = log(1000)/1000
+        T60  = tau_ms * logk  (seconds)
+        alpha = exp(-ln(1000) / (T60 * fs))
+
+        Result: same effective behavior as Amplitude.ar with T60 = tau_ms*logk.
         """
-        # tau in seconds
-        tau_s = torch.clamp(tau_ms, 0.1, 1000.0) / 1000.0
-        fs = torch.tensor(float(self.sample_rate), device=tau_ms.device)
-        # Eq. (10): alpha = exp(-1 / (tau * fs))
-        alpha = torch.exp(-1.0 / (tau_s * fs))
+        fs = torch.tensor(float(self.sample_rate), device=tau_ms.device, dtype=tau_ms.dtype)
+        ln1000 = torch.log(torch.tensor(1000.0, device=tau_ms.device, dtype=tau_ms.dtype))
+        logk = ln1000 / 1000.0
+
+        tau_ms = torch.clamp(tau_ms, 0.1, 1000.0)
+        T60 = tau_ms * logk / 1000.0   # seconds
+
+        alpha = torch.exp(-ln1000 / (T60 * fs))
         return alpha
 
+ 
     def _nonlinear_envelope(self, x: torch.Tensor, alpha: torch.Tensor, mode: str) -> torch.Tensor:
         """
         Non-linear envelope follower as in Eqs. (9–10).
@@ -137,79 +150,196 @@ class OptimizedDASPACE(nn.Module):
 
     def enva(self, x: torch.Tensor, tau_ms: torch.Tensor) -> torch.Tensor:
         """Envelope with smooth attack, instant decay."""
-        alpha = self._time_constant_to_alpha(tau_ms)
+        alpha = self._time_constant_to_alpha_T60(tau_ms)
         return self._nonlinear_envelope(x, alpha, mode="attack")
 
     def envd(self, x: torch.Tensor, tau_ms: torch.Tensor) -> torch.Tensor:
         """Envelope with smooth decay, instant attack."""
-        alpha = self._time_constant_to_alpha(tau_ms)
+        alpha = self._time_constant_to_alpha_T60(tau_ms)
         return self._nonlinear_envelope(x, alpha, mode="decay")
 
     
-    def high_pass_filter(self, x: torch.Tensor, freq: torch.Tensor) -> torch.Tensor:
+    def high_pass_filter(self, x: torch.Tensor, freq: torch.Tensor, sample_rate: float) -> torch.Tensor:
         """Simple high-pass filter implementation"""
         # For now, use a simple frequency-domain approach
         # In production, you'd implement proper biquad filtering
-        return x  # Placeholder
+        return torchaudio.functional.highpass_biquad(x, sample_rate, freq)
+
+    def _design_high_shelf(self,
+                        freq: torch.Tensor,
+                        slope: torch.Tensor,
+                        gain_db: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        """
+        RBJ high-shelf filter design.
+        Returns normalized biquad coefficients (b0,b1,b2,a1,a2), a0 assumed = 1.
+        All scalars as 0D tensors on correct device/dtype.
+        """
+        fs  = torch.tensor(float(self.sample_rate),
+                        device=freq.device, dtype=freq.dtype)
+        # clamp
+        f0  = freq.clamp(20.0, fs/2 - 100.0)
+        S   = slope.clamp(0.1, 2.0)
+        A   = torch.pow(10.0, gain_db / 40.0)      # 10^(dBgain/40)
+        w0  = 2.0 * math.pi * f0 / fs
+        cosw0 = torch.cos(w0)
+        sinw0 = torch.sin(w0)
+
+        # RBJ alpha
+        tmp = (A + 1.0 / A) * (1.0 / S - 1.0) + 2.0
+        alpha = sinw0 / 2.0 * torch.sqrt(tmp)
+
+        sqrtA = torch.sqrt(A)
+
+        b0 =    A * ((A + 1.0) + (A - 1.0) * cosw0 + 2.0 * sqrtA * alpha)
+        b1 = -2*A * ((A - 1.0) + (A + 1.0) * cosw0)
+        b2 =    A * ((A + 1.0) + (A - 1.0) * cosw0 - 2.0 * sqrtA * alpha)
+        a0 =        (A + 1.0) - (A - 1.0) * cosw0 + 2.0 * sqrtA * alpha
+        a1 =  2.0 * ((A - 1.0) - (A + 1.0) * cosw0)
+        a2 =        (A + 1.0) - (A - 1.0) * cosw0 - 2.0 * sqrtA * alpha
+
+        # normalize so a0 = 1
+        b0 = b0 / a0
+        b1 = b1 / a0
+        b2 = b2 / a0
+        a1 = a1 / a0
+        a2 = a2 / a0
+
+        return b0, b1, b2, a1, a2
     
-    def high_shelf_filter(self, x: torch.Tensor, freq: torch.Tensor, slope: torch.Tensor, gain_db: torch.Tensor) -> torch.Tensor:
-        """High shelf filter implementation"""
-        gain_linear = torch.pow(10.0, gain_db / 20.0)
-        return x * gain_linear  # Simplified implementation
+    def high_shelf_filter(self,
+                        x: torch.Tensor,
+                        freq: torch.Tensor,
+                        slope: torch.Tensor,
+                        gain_db: torch.Tensor) -> torch.Tensor:
+        """
+        Differentiable biquad high-shelf filter.
+        x: [B, C, T]
+        freq, slope, gain_db: scalar tensors (same across batch/channels)
+        """
+        B, C, T = x.shape
+        device, dtype = x.device, x.dtype
+
+        # design biquad coeffs (scalars)
+        b0, b1, b2, a1, a2 = self._design_high_shelf(
+            freq.to(device=device, dtype=dtype),
+            slope.to(device=device, dtype=dtype),
+            gain_db.to(device=device, dtype=dtype)
+        )
+
+        # flatten batch+channels -> [N, T]
+        N = B * C
+        x_flat = x.reshape(N, T)
+
+        # DF-II Transposed
+        y_flat = torch.zeros_like(x_flat)
+        z1 = torch.zeros(N, device=device, dtype=dtype)
+        z2 = torch.zeros(N, device=device, dtype=dtype)
+
+        for n in range(T):
+            xn = x_flat[:, n]
+            yn = b0 * xn + z1
+            z1_new = b1 * xn - a1 * yn + z2
+            z2     = b2 * xn - a2 * yn
+            z1     = z1_new
+            y_flat[:, n] = yn
+
+        y = y_flat.view(B, C, T)
+        return y
+
     
     def db_to_amplitude(self, db: torch.Tensor) -> torch.Tensor:
         """Convert dB to linear amplitude"""
         return torch.pow(10.0, db / 20.0)
+
+    def amplitude_env(self, x: torch.Tensor, attack_tau_ms: torch.Tensor, release_tau_ms: torch.Tensor) -> torch.Tensor:
+        """
+        Emulate SuperCollider Amplitude.ar with T60-mapped times.
+
+        x: [B, C, T] or [B, C, K, T]
+        """
+        if x.dim() == 3:
+            B, C, T = x.shape
+            x_abs = x.abs()
+
+            alphaA = self._time_constant_to_alpha_T60(attack_tau_ms).to(x.device, x.dtype)
+            alphaR = self._time_constant_to_alpha_T60(release_tau_ms).to(x.device, x.dtype)
+
+            y = torch.empty_like(x_abs)
+            y_prev = torch.zeros(B, C, device=x.device, dtype=x.dtype)
+
+            for n in range(T):
+                xn = x_abs[..., n]
+                # Different coefficients for rising vs falling
+                rising = xn > y_prev
+                alpha = torch.where(rising, alphaA, alphaR)
+                one_minus = 1.0 - alpha
+                y_curr = one_minus * xn + alpha * y_prev
+                y[..., n] = y_curr
+                y_prev = y_curr
+            return y
+
+        elif x.dim() == 4:
+            B, C, K, T = x.shape
+            x_abs = x.abs()
+
+            alphaA = self._time_constant_to_alpha_T60(attack_tau_ms).to(x.device, x.dtype)
+            alphaR = self._time_constant_to_alpha_T60(release_tau_ms).to(x.device, x.dtype)
+
+            y = torch.empty_like(x_abs)
+            y_prev = torch.zeros(B, C, K, device=x.device, dtype=x.dtype)
+
+            for n in range(T):
+                xn = x_abs[..., n]
+                rising = xn > y_prev
+                alpha = torch.where(rising, alphaA, alphaR)
+                one_minus = 1.0 - alpha
+                y_curr = one_minus * xn + alpha * y_prev
+                y[..., n] = y_curr
+                y_prev = y_curr
+            return y
+
+        else:
+            raise ValueError("amplitude_env expects 3D or 4D input")
+
     
     def temporal_contrast_enhancement(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Temporal Contrast Enhancement (TCE) following Weger et al. (ICAD 2019), Sec. 2.2, Eqs. (12–14).
-
-        x: [batch, channels, time]  -> original signal s[n]
-        returns st[n] with transient emphasis
+        Temporal ACE exactly following the SuperCollider SynthDef:
+        - High-pass at fHPFtc
+        - env_d = Amplitude(sigTC.abs, 0, tcT60D)
+        - env_a = Amplitude(env_d, tcT60A, 0)
+        - env_e = (env_d - env_a - nu.dbamp).clip(0, 1)
+        - sigTC = sigTC * env_e / (Amplitude(env_e, 0, tcT60D) + regDelta)
         """
-
-        # 1) High-pass filter to emphasize high-frequency transients
-        # In the paper, this is a 2nd-order HPF; here we call a placeholder
-        # you should implement this with a proper biquad or DASP filter.
+        # sigTC = HPF(sig, fHPFtc)
         tce_hpf_freq = torch.clamp(self.fHPFtc, 100.0, self.sample_rate / 2.0)
-        sh = self.high_pass_filter(x, tce_hpf_freq)  # sh[n]
+        sigTC = self.high_pass_filter(x, tce_hpf_freq, self.sample_rate)
 
-        # 2) Envelope followers for transient detection
-        # Time constants for temporal ACE (paper suggests tauA ≈ 3 ms, tauD ≈ 7 ms)
-        tau_a_ms = torch.clamp(self.tauAtc, 1.0, 100.0)  # attack time constant for enva
-        tau_d_ms = torch.clamp(self.tauDtc, 1.0, 100.0)  # decay time constant for envd
+        logk = torch.log(torch.tensor(1000.0, device=x.device, dtype=x.dtype)) / 1000.0
+        # T60 in ms -> seconds is done inside amplitude_env via _time_constant_to_alpha_T60
 
-        # et,d[n] = envd{ sh[n] }
-        et_d = self.envd(sh, tau_d_ms)
+        tcT60D = torch.clamp(self.tauDtc, 1.0, 100.0)  # ms (same range as SC GUI)
+        tcT60A = torch.clamp(self.tauAtc, 1.0, 100.0)  # ms
 
-        # et,a[n] = enva{ et,d[n] }
-        et_a = self.enva(et_d, tau_a_ms)
+        # env_d = Amplitude(sigTC.abs, 0, tcT60D)
+        env_d = self.amplitude_env(sigTC.abs(), torch.tensor(0.0, device=x.device, dtype=x.dtype), tcT60D)
 
-        # 3) Transient envelope et[n] = max{ et,d - et,a - nu, 0 }
-        # Your parameter self.nu is stored in dB; convert to linear amplitude.
-        # Clamp like in the paper (roughly -60..0 dB relative threshold).
-        nu_amp = self.db_to_amplitude(torch.clamp(self.nu, -60.0, 0.0))
-        # Broadcast to match [B, C, T]
-        nu_amp = nu_amp.to(x.device, x.dtype).view(1, 1, 1)
+        # env_a = Amplitude(env_d, tcT60A, 0)
+        env_a = self.amplitude_env(env_d, tcT60A, torch.tensor(0.0, device=x.device, dtype=x.dtype))
 
-        et = (et_d - et_a - nu_amp).clamp(min=0.0)
+        # env_e = (env_d - env_a - nu.dbamp).clip(0, 1)
+        nu_amp = self.db_to_amplitude(self.nu.clamp(-60.0, 0.0)).to(x.device, x.dtype).view(1, 1, 1)
+        env_e = (env_d - env_a - nu_amp).clamp(0.0, 1.0)
 
-        # 4) Normalization envelope envd{et[n]} for equation (14)
-        # Use the same decay time constant tau_d_ms for this envd.
-        et_env = self.envd(et, tau_d_ms)
+        # denominator: Amplitude(env_e, 0, tcT60D) + regDelta
+        env_e_slow = self.amplitude_env(env_e, torch.tensor(0.0, device=x.device, dtype=x.dtype), tcT60D)
+        regDelta = self.db_to_amplitude(self.dBregDelta.clamp(-120.0, -60.0)).to(x.device, x.dtype).view(1, 1, 1)
 
-        # Regularization: add small delta (you already have dBregDelta)
-        reg_delta = self.db_to_amplitude(torch.clamp(self.dBregDelta, -120.0, -60.0))
-        reg_delta = reg_delta.to(x.device, x.dtype).view(1, 1, 1)
+        sigTC_enh = sigTC * (env_e / (env_e_slow + regDelta))
 
-        denom = et_env + reg_delta
+        return sigTC_enh
 
-        # 5) Output: st[n] = s[n] * et[n] / envd{et[n]}
-        modulation = et / denom
-        st = x * modulation
-
-        return st
+ 
     
     """ Spectral Contrast Enhancement (SCE) Functions """
     
@@ -421,161 +551,153 @@ class OptimizedDASPACE(nn.Module):
         
         return envelope
 
-    def spectral_contrast_enhancement(self,
-                                      band_signals: torch.Tensor) -> torch.Tensor:
+    def spectral_contrast_enhancement(self, band_signals: torch.Tensor) -> torch.Tensor:
         """
-        Spectral ACE: LI (sharpening) + EX (dynamics expansion)
-        + DP (decay prolongation), following Weger et al. (ICAD 2019).
+        Spectral ACE (LI + EX + DP) following Marian Weger's SuperCollider SynthDef.
 
-        band_signals: [B, C, K, T]  (real subband signals ck[n])
-        returns processed subbands c'_k[n] with envelopes pk[n].
+        Args:
+            band_signals: [B, C, K, T]  real subband signals from gammatone filterbank
+                B = batch, C = channels, K = bands, T = time
+
+        Returns:
+            processed subbands c'_k[n]  [B, C, K, T]
         """
-        assert band_signals.dim() == 4
         B, C, K, T = band_signals.shape
+        device, dtype = band_signals.device, band_signals.dtype
         x = band_signals
 
-        device, dtype = x.device, x.dtype
+        # --- 0. envelopes per channel and mono mix -------------------------------
+        env0 = x.abs()                     # [B,C,K,T]
+        env  = env0.mean(dim=1, keepdim=True)  # [B,1,K,T]  mono envelope for processing
 
-        # 0) Envelopes ek[n]
-        ek = x.abs()                                         # [B,C,K,T]
-
-        # 1) Smooth envelopes for LI (ẽk)  -- τ ≈ 7 ms in paper
+        # --- 1. Leaky integrator (LI) -------------------------------------------
         tau_li_ms = torch.clamp(self.tauLI, 1.0, 50.0)
-        e_tilde = self.leaky_integrator(ek, tau_li_ms)       # [B,C,K,T]
+        env_s = self.amplitude_env(env, tau_li_ms, tau_li_ms)  # Amplitude.ar(env, liT60, liT60)
 
-        # 2) Lateral inhibition term Tk[n]
-        Tk = self._lateral_inhibition(e_tilde)               # [B,C,K,T]
+        # ERB–Gaussian lateral inhibition
+        fc = self._erb_space(50.0, self.sample_rate / 2.0, K, device, dtype)
+        fc_erb = self._hz_to_erb(fc)
+        sigma_erb = 3.0
+        delta = fc_erb.view(K, 1) - fc_erb.view(1, K)
+        weights = torch.exp(-(delta ** 2) / (2.0 * sigma_erb ** 2))
+        weights = weights * (1.0 - torch.eye(K, device=device, dtype=dtype))
+        weights = weights / (weights.sum(dim=1, keepdim=True) + 1e-12)
 
-        # 3) Spectral sharpening (Eq. 6)
+        e2 = env_s.pow(2).squeeze(1)                           # [B,K,T]
+        T2 = torch.einsum('ki,b i t -> b k t', weights, e2)    # inhibition term
+        T = torch.sqrt(T2 + 1e-12).unsqueeze(1)                # [B,1,K,T]
+
         rho = torch.clamp(self.rho, 0.0, 100.0)
-        reg_delta = self.db_to_amplitude(
-            torch.clamp(self.dBregDelta, -120.0, -60.0)
-        ).to(device=device, dtype=dtype).view(1, 1, 1, 1)
+        regDelta = self.db_to_amplitude(self.dBregDelta.clamp(-120.0, -60.0)).to(device)
+        env_li = env * ((env_s / (T + regDelta)) ** rho).clamp(0.0, 1.0)
 
-        ratio_li = torch.pow(
-            torch.clamp(e_tilde / (Tk + reg_delta), min=0.0),
-            rho
-        )
-        ratio_li = ratio_li.clamp(max=1.0)
-        uk = ek * ratio_li                                   # [B,C,K,T]
-
-        # 4) Smoothed envelopes for EX (ũk) with τ_EX
+        # --- 2. Dynamics expansion (EX) -----------------------------------------
         tau_ex_ms = torch.clamp(self.tauEX, 1.0, 100.0)
-        u_tilde = self.leaky_integrator(uk, tau_ex_ms)       # [B,C,K,T]
+        env_ex_s = self.amplitude_env(env_li, tau_ex_ms, tau_ex_ms)
+        env_ex_smax, _ = env_ex_s.max(dim=2, keepdim=True)  # [B,1,1,T]
 
-        # Instantaneous global max û_max[n] (Eq. 8)
-        u_max, _ = u_tilde.max(dim=2, keepdim=True)          # [B,C,1,T]
-
-        # 5) Spectral dynamics expansion (Eq. 7)
         beta = torch.clamp(self.beta, 0.0, 20.0)
-        # mu stored in dB -> convert to linear in [0,1]
-        mu_lin = torch.clamp(self.db_to_amplitude(self.mu),
-                             0.0, 1.0).to(
-                                 device=device, dtype=dtype
-                             ).view(1, 1, 1, 1)
+        mu_lin = self.db_to_amplitude(self.mu).to(device)
+        thresh = mu_lin * env_ex_smax
 
-        thresh = mu_lin * u_max                              # [B,C,1,T]
+        gain1 = (env_ex_s / (thresh + regDelta)).clamp(0.0, 10.0) ** beta
+        gain2 = (env_ex_smax / (env_ex_s + regDelta)).clamp(0.0, 10.0)
+        env_ex = env_li * torch.minimum(gain1, gain2)
 
-        gain1 = torch.pow(
-            torch.clamp(u_tilde / (thresh + reg_delta), min=0.0),
-            beta
-        )
-        gain2 = torch.clamp(u_max / (u_tilde + reg_delta), min=0.0)
+        # --- 3. Decay prolongation (DP) -----------------------------------------
+        # per-band T60(fc)
+        fc = fc.view(1, 1, K, 1)
+        T60cut = torch.clamp(self.t60atCutoff, 0.01, 5.0).to(device)
+        fcut   = torch.clamp(self.dpCutoff, 100.0, self.sample_rate / 2.0).to(device)
+        T60 = torch.where(fc <= fcut, T60cut, T60cut * (fcut / fc))
+        fs = torch.tensor(float(self.sample_rate), device=device, dtype=dtype)
+        ln1000 = torch.log(torch.tensor(1000.0, device=device, dtype=dtype))
+        alpha = torch.exp(-ln1000 / (T60 * fs))               # [1,1,K,1]
 
-        gain_ex = torch.minimum(gain1, gain2)                # Eq. 7 min(...)
-        vk = uk * gain_ex                                    # [B,C,K,T]
+        # Apply attack/decay envelope pair with residuum (Eq. 11)
+        v = env_ex
+        env_a = self.amplitude_env(v, self.tauAdp, torch.tensor(0.0, device=device, dtype=dtype))
+        env_d = self.amplitude_env(env_a, torch.tensor(0.0, device=device, dtype=dtype), self.tauAdp)
+        env_dp = env_d + (v - env_a)
 
-        # 6) Decay prolongation (Eq. 11)
-        band_centers = self._erb_space(50.0,
-                                       self.sample_rate / 2.0,
-                                       K, device, dtype)     # [K]
-        pk = self._decay_prolongation(vk, band_centers)      # [B,C,K,T]
+        # --- 4. Short smoothing before applying ratio (SP) -----------------------
+        tau_sp_ms = torch.clamp(self.tauSP, 0.5, 20.0)
+        env0_mono = env0.mean(dim=1, keepdim=True)            # [B,1,K,T]
+        env_lp0 = self.amplitude_env(env0_mono, tau_sp_ms, tau_sp_ms)
+        env_lp  = self.amplitude_env(env_dp,     tau_sp_ms, tau_sp_ms)
 
-        # 7) Final short smoothing (LP blocks before Eq. 2)
-        tau_sp_ms = torch.clamp(self.tauSP, 0.5, 20.0)       # paper uses ≈2 ms
-        ek_lp = self.leaky_integrator(ek, tau_sp_ms)
-        pk_lp = self.leaky_integrator(pk, tau_sp_ms)
+        # --- 5. Apply processed envelope back to subbands ------------------------
+        env_ratio = env_lp / (env_lp0 + regDelta)
+        band_weights = torch.clamp(self.band_gains, 0.0, 5.0).view(1, 1, K, 1)
 
-        # 8) Apply processed envelope back to subbands (Eq. 2)
-        env_ratio = pk_lp / (ek_lp + reg_delta)
-
-        # Optional per-band weights
-        band_weights = torch.clamp(self.band_gains,
-                                   0.0, 5.0).view(1, 1, K, 1)
-
-        c_out = x * env_ratio * band_weights                 # [B,C,K,T]
-
+        c_out = x * env_ratio * band_weights
         return c_out
  
     
     def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
         """
-        Complete ACE processing pipeline following SuperCollider implementation
+        Complete ACE processing pipeline faithfully following Marian Weger's SuperCollider implementation.
         """
-        # Store original for wet/dry mix
+        # Store original for dry/wet mix
         dry = x.clone()
-        
-        # Input high-pass filtering
+
+        # 1. Input high-pass
         hpf_freq = torch.clamp(self.fHPF, 20.0, 1000.0)
-        filtered_input = self.high_pass_filter(x, hpf_freq)
-        
-        # Temporal Contrast Enhancement (TCE)
-        tce_output = self.temporal_contrast_enhancement(filtered_input)
-        
-        # Spectral Contrast Enhancement (SCE)
-        # Apply gammatone filterbank
-        band_signals = self.apply_gammatone_filterbank(filtered_input)
-        
-        # Apply SCE processing
-        sce_bands = self.spectral_contrast_enhancement(band_signals)
-        
-        # Reconstruct signal by summing across frequency bands
-        noise_amp = self.db_to_amplitude(
-            torch.clamp(self.dbNoise, -120.0, -60.0)
-        )
-        noisy_input = filtered_input + noise_amp * torch.randn_like(filtered_input)
+        sig = self.high_pass_filter(x, hpf_freq, self.sample_rate)
 
-        band_signals = self.apply_gammatone_filterbank(noisy_input)   # [B,C,K,T]
+        # ---------------- TCE BRANCH ----------------
+        tce_output = self.temporal_contrast_enhancement(sig)
 
-        sce_bands = self.spectral_contrast_enhancement(band_signals)  # [B,C,K,T]
-        sce_output = torch.sum(sce_bands, dim=2)                       # [B,C,T]
-        # sce_output = torch.sum(sce_bands, dim=2)  # [batch, channels, time]
-        
-        # Apply high shelf filter
-        hsf_freq = torch.clamp(self.fHSF, 1000.0, self.sample_rate/2)
+        # ---------------- SCE BRANCH ----------------
+        # High-shelf filter (pre-emphasis)
+        hsf_freq  = torch.clamp(self.fHSF, 1000.0, self.sample_rate / 2.0)
         hsf_slope = torch.clamp(self.sHSF, 0.1, 2.0)
-        hsf_gain_neg = -torch.clamp(self.dbHSF, -20.0, 20.0)  # Negative for compensation
+        hsf_gain  = self.dbHSF
+        sigSC = self.high_shelf_filter(sig, hsf_freq, hsf_slope, hsf_gain)
+
+        # Add pink-ish noise (for envelope stability)
+        noise_amp = self.db_to_amplitude(self.dbNoise.clamp(-120.0, -60.0))
+        sigSC_noisy = sigSC + noise_amp * torch.randn_like(sigSC)
+
+        # Apply gammatone filterbank
+        band_signals = self.apply_gammatone_filterbank(sigSC_noisy)  # [B, C, K, T]
+
+        # Apply SCE (LI + EX + DP + SP)
+        sce_bands = self.spectral_contrast_enhancement(band_signals)  # [B, C, K, T]
+
+        # Reconstruct broadband signal
+        sce_output = torch.sum(sce_bands, dim=2)  # [B, C, T]
+
+        # Post high-shelf compensation (negative gain)
+        hsf_gain_neg = -torch.clamp(self.dbHSF, -20.0, 20.0)
         sce_filtered = self.high_shelf_filter(sce_output, hsf_freq, hsf_slope, hsf_gain_neg)
-        
-        # Crossfade between TCE and SCE based on dimWeight
+
+        # Crossfade TCE and SCE (dimWeight)
         dim_weight = torch.clamp(self.dimWeight, 0.0, 1.0)
-        enhanced = (1 - dim_weight) * tce_output + dim_weight * sce_filtered
-        
+        enhanced = (1.0 - dim_weight) * tce_output + dim_weight * sce_filtered
+
         # Final high-pass filter
-        enhanced = self.high_pass_filter(enhanced, hpf_freq)
-        
-        # Output processing: volume and wet/dry mix
+        enhanced = self.high_pass_filter(enhanced, hpf_freq, self.sample_rate)
+
+        # Volume + dry/wet mix
         vol_gain = self.db_to_amplitude(torch.clamp(self.vol, -60.0, 20.0))
         wet_amount = torch.clamp(self.wet, 0.0, 1.0)
-        
-        # Apply volume
         wet = enhanced * vol_gain
-        
-        # Wet/dry mix
-        output = (1 - wet_amount) * dry + wet_amount * wet
-        
-        # Clip output to prevent clipping
+        output = (1.0 - wet_amount) * dry + wet_amount * wet
+
+        # Prevent clipping
         output = torch.clamp(output, -1.0, 1.0)
-        
+
+        # Return all useful intermediate signals for inspection
         return {
-            'output': output,
-            'dry': dry,
-            'wet': wet,
-            'enhanced': enhanced,
-            'tce_output': tce_output,
-            'sce_output': sce_output,
-            'band_signals': band_signals,
-            'sce_bands': sce_bands
+            "output": output,          # final dry+wet output
+            "dry": dry,                # original
+            "wet": wet,                # processed before mix
+            "enhanced": enhanced,      # crossfaded ACE
+            "tce_output": tce_output,  # transient-only
+            "sce_output": sce_output,  # reconstructed spectral
+            "band_signals": band_signals,  # gammatone subbands
+            "sce_bands": sce_bands     # processed subbands
         }
     
     def get_parameters_dict(self) -> Dict[str, float]:
@@ -662,3 +784,57 @@ if __name__ == "__main__":
         print(f"✗ Error: {e}")
         import traceback
         traceback.print_exc()
+
+def create_ace_with_gui_params(sample_rate: float = 44100) -> OptimizedDASPACE:
+    ace = OptimizedDASPACE(sample_rate=sample_rate)
+
+    gui_params = {
+        # TCE
+        "fHPFtc":      4000.0,
+        "tauAtc":      7.0,
+        "tauDtc":      16.0,
+        "nu":         -60.0,
+
+        # High-shelf
+        "fHSF":        4000.0,
+        "sHSF":           0.1,
+        "dbHSF":         0.0,
+
+        # Noise
+        "dbNoise":    -96.0,
+
+        # LI
+        "rho":         25.0,
+        "tauLI":       7.0,
+
+        # EX
+        "beta":        1.0,
+        "mu":         -3.0,
+        "tauEX":       7.0,
+
+        # DP
+        "tauAdp":      7.0,
+        "t60atCutoff": 0.72,   # seconds, as in GUI
+        "dpCutoff":  1000.0,
+
+        # Regularization
+        "dBregDelta": -96.0,
+
+        # Summation smoothing
+        "tauSP":       2.0,
+
+        # Mixing
+        "wet":         0.9,
+        "dimWeight":   1.0,    # SCE only
+        "vol":         6.0,    # dB
+    }
+
+    with torch.no_grad():
+        for name, value in gui_params.items():
+            if hasattr(ace, name):
+                getattr(ace, name).data.fill_(float(value))
+
+        # band_gains = 1.0 for all bands (GUI default)
+        ace.band_gains.data.fill_(1.0)
+
+    return ace

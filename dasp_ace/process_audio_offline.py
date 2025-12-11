@@ -16,7 +16,7 @@ sys.path.append(str(Path(__file__).parent))
 
 try:
     # from ace_dasp_optimized import OptimizedDASPACE
-    from ace_dasp import OptimizedDASPACE
+    from ace_dasp import OptimizedDASPACE, create_ace_with_gui_params
     print("✓ DASP ACE implementation loaded successfully")
 except ImportError as e:
     print(f"✗ Failed to import DASP ACE: {e}")
@@ -169,11 +169,12 @@ def process_audio_file(input_path: str,
     
     # Create ACE processor
     print(f"Initializing DASP ACE processor ({n_bands} bands)...")
-    ace_processor = OptimizedDASPACE(
-        sample_rate=float(sample_rate),
-        n_bands=n_bands,
-        filter_duration=0.02
-    )
+    # ace_processor = OptimizedDASPACE(
+    #     sample_rate=float(sample_rate),
+    #     n_bands=n_bands,
+    #     filter_duration=0.02
+    # )
+    ace_processor = create_ace_with_gui_params(sample_rate=int(sample_rate))
     
     # Set custom parameters if provided
     if ace_params:
