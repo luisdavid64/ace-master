@@ -40,13 +40,51 @@ class OptimizedDASPACE(nn.Module):
             duration=filter_duration
         )
         
-        # CRITICAL FIX: Prevent massive over-amplification with simple scaling
-        # The raw DASP filters cause ~100x amplification. Apply a conservative
-        # scaling factor to bring it to reasonable levels.
-        conservative_scale = 0.16  # Targeting ~1.2x enhancement
-        self.filterbank = raw_filterbank * conservative_scale
+        # SUPERCOLLIDER-STYLE NORMALIZATION: Match CGammatone coefficient-based approach
+        # This mimics SuperCollider's: normalisation = 2.0*(pow(1-fabs(lambda),4))
+        import math
         
-        print(f"Filterbank scaling: applied {conservative_scale}x factor to prevent over-amplification")
+        with torch.no_grad():
+            print("Applying SuperCollider-style coefficient-based normalization...")
+            
+            # Get center frequencies for each band (matching DASP's ERB spacing)
+            low_freq = 50.0
+            high_freq = sample_rate // 2
+            
+            # Calculate ERB-spaced center frequencies (matching DASP)
+            freqs = []
+            erb_low = self._freq_to_erb(low_freq)
+            erb_high = self._freq_to_erb(high_freq)
+            erb_points = torch.linspace(erb_low, erb_high, n_bands)
+            
+            for erb in erb_points:
+                freq = self._erb_to_freq(erb)
+                freqs.append(freq.item())
+            
+            # Apply SuperCollider normalization per band
+            sampling_period = 1.0 / sample_rate
+            
+            for i, center_freq in enumerate(freqs):
+                # SuperCollider bandwidth calculation (ERB-based)
+                erb_bandwidth = 24.7 * (4.37 * center_freq / 1000.0 + 1.0)
+                
+                # SuperCollider's coefficient calculation
+                phi = math.pi * erb_bandwidth * sampling_period
+                # For 4dB attenuation and order 4 (from SuperCollider code)
+                p = (1.5886564694486 * math.cos(phi) - 2) * 4.8621160938616
+                lambda_val = (p * (-0.5)) - math.sqrt(p*p*0.25 - 1.0)
+                
+                # SuperCollider's normalization: 2.0*(1-|lambda|)^4
+                sc_normalization = 2.0 * pow(1 - abs(lambda_val), 4)
+                
+                # Apply to this band's filter
+                raw_filterbank[i] *= sc_normalization
+            
+            print(f"Applied SuperCollider coefficient normalization to {n_bands} bands")
+        
+        self.filterbank = raw_filterbank
+        
+        print(f"SuperCollider-style filterbank normalization applied")
         
         # All SuperCollider ACE parameters as learnable parameters
         # Core filter parameters
@@ -88,6 +126,18 @@ class OptimizedDASPACE(nn.Module):
         
         # Band-specific gains (learnable per frequency band)
         self.band_gains = nn.Parameter(torch.ones(n_bands))     # band weights
+    
+    def _freq_to_erb(self, freq):
+        """Convert frequency to ERB scale (matching SuperCollider's approach)"""
+        if isinstance(freq, (int, float)):
+            freq = torch.tensor(freq, dtype=torch.float32)
+        return 21.4 * torch.log10(1 + 4.37 * freq / 1000.0)
+    
+    def _erb_to_freq(self, erb):
+        """Convert ERB scale back to frequency"""
+        if isinstance(erb, (int, float)):
+            erb = torch.tensor(erb, dtype=torch.float32)
+        return 1000.0 * (10**(erb / 21.4) - 1) / 4.37
         # self.hpf_module = DifferentiableHPF(sample_rate)  # Commented out
 
 
