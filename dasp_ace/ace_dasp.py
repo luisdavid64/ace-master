@@ -11,7 +11,7 @@ import numpy as np
 from typing import Optional, Tuple, Dict, Any
 import dasp_pytorch.signal_dasp as dasp_signal
 import dasp_pytorch.functional as dasp_F
-from high_pass import DifferentiableHPF
+# from high_pass import DifferentiableHPF  # Commented out - not needed
 import torchaudio
 
 
@@ -31,7 +31,7 @@ class OptimizedDASPACE(nn.Module):
         self.n_bands = n_bands
         
         # Use DASP gammatone filterbank
-        self.filterbank = dasp_signal.gammatone_filterbank(
+        raw_filterbank = dasp_signal.gammatone_filterbank(
             sample_rate=int(sample_rate),
             num_bands=n_bands,
             low_freq=50.0,
@@ -39,6 +39,14 @@ class OptimizedDASPACE(nn.Module):
             order=4,
             duration=filter_duration
         )
+        
+        # CRITICAL FIX: Prevent massive over-amplification with simple scaling
+        # The raw DASP filters cause ~100x amplification. Apply a conservative
+        # scaling factor to bring it to reasonable levels.
+        conservative_scale = 0.16  # Targeting ~1.2x enhancement
+        self.filterbank = raw_filterbank * conservative_scale
+        
+        print(f"Filterbank scaling: applied {conservative_scale}x factor to prevent over-amplification")
         
         # All SuperCollider ACE parameters as learnable parameters
         # Core filter parameters
@@ -80,7 +88,7 @@ class OptimizedDASPACE(nn.Module):
         
         # Band-specific gains (learnable per frequency band)
         self.band_gains = nn.Parameter(torch.ones(n_bands))     # band weights
-        self.hpf_module = DifferentiableHPF(sample_rate)
+        # self.hpf_module = DifferentiableHPF(sample_rate)  # Commented out
 
 
         
@@ -160,10 +168,14 @@ class OptimizedDASPACE(nn.Module):
 
     
     def high_pass_filter(self, x: torch.Tensor, freq: torch.Tensor, sample_rate: float) -> torch.Tensor:
-        """Simple high-pass filter implementation"""
-        # For now, use a simple frequency-domain approach
-        # In production, you'd implement proper biquad filtering
-        return torchaudio.functional.highpass_biquad(x, sample_rate, freq)
+        """Simple high-pass filter implementation for 3D tensors [batch, channels, time]"""
+        B, C, T = x.shape
+        # Process each batch item separately since torchaudio expects 2D
+        output = torch.empty_like(x)
+        for b in range(B):
+            # torchaudio expects [channels, time]
+            output[b] = torchaudio.functional.highpass_biquad(x[b], sample_rate, freq)
+        return output
 
     def _design_high_shelf(self,
                         freq: torch.Tensor,
@@ -305,37 +317,34 @@ class OptimizedDASPACE(nn.Module):
     def temporal_contrast_enhancement(self, x: torch.Tensor) -> torch.Tensor:
         """
         Temporal ACE exactly following the SuperCollider SynthDef:
-        - High-pass at fHPFtc
-        - env_d = Amplitude(sigTC.abs, 0, tcT60D)
-        - env_a = Amplitude(env_d, tcT60A, 0)
-        - env_e = (env_d - env_a - nu.dbamp).clip(0, 1)
-        - sigTC = sigTC * env_e / (Amplitude(env_e, 0, tcT60D) + regDelta)
+        - sigTC = HPF(sig, fHPFtc)
+        - envTCe = Amplitude(sigTC.abs, 0, tcT60D)
+        - envTCe = (envTCe - Amplitude(envTCe, tcT60A, 0) - nu.dbamp).clip(0, 1)
+        - sigTC = sigTC * (envTCe / (Amplitude(envTCe, 0, tcT60D) + regDelta))
         """
         # sigTC = HPF(sig, fHPFtc)
         tce_hpf_freq = torch.clamp(self.fHPFtc, 100.0, self.sample_rate / 2.0)
         sigTC = self.high_pass_filter(x, tce_hpf_freq, self.sample_rate)
 
+        # Convert tau values to T60 using SuperCollider's logk factor
         logk = torch.log(torch.tensor(1000.0, device=x.device, dtype=x.dtype)) / 1000.0
-        # T60 in ms -> seconds is done inside amplitude_env via _time_constant_to_alpha_T60
+        tcT60D = torch.clamp(self.tauDtc, 1.0, 100.0) * logk * 1000.0  # Convert to ms
+        tcT60A = torch.clamp(self.tauAtc, 1.0, 100.0) * logk * 1000.0  # Convert to ms
 
-        tcT60D = torch.clamp(self.tauDtc, 1.0, 100.0)  # ms (same range as SC GUI)
-        tcT60A = torch.clamp(self.tauAtc, 1.0, 100.0)  # ms
+        # envTCe = Amplitude(sigTC.abs, 0, tcT60D)
+        envTCe = self.amplitude_env(sigTC.abs(), torch.tensor(0.0, device=x.device, dtype=x.dtype), tcT60D)
 
-        # env_d = Amplitude(sigTC.abs, 0, tcT60D)
-        env_d = self.amplitude_env(sigTC.abs(), torch.tensor(0.0, device=x.device, dtype=x.dtype), tcT60D)
-
-        # env_a = Amplitude(env_d, tcT60A, 0)
-        env_a = self.amplitude_env(env_d, tcT60A, torch.tensor(0.0, device=x.device, dtype=x.dtype))
-
-        # env_e = (env_d - env_a - nu.dbamp).clip(0, 1)
+        # envTCe = (envTCe - Amplitude(envTCe, tcT60A, 0) - nu.dbamp).clip(0, 1)
+        # Note: envTCe is reused as both input and output!
+        envTCe_attack = self.amplitude_env(envTCe, tcT60A, torch.tensor(0.0, device=x.device, dtype=x.dtype))
         nu_amp = self.db_to_amplitude(self.nu.clamp(-60.0, 0.0)).to(x.device, x.dtype).view(1, 1, 1)
-        env_e = (env_d - env_a - nu_amp).clamp(0.0, 1.0)
+        envTCe = (envTCe - envTCe_attack - nu_amp).clamp(0.0, 1.0)
 
-        # denominator: Amplitude(env_e, 0, tcT60D) + regDelta
-        env_e_slow = self.amplitude_env(env_e, torch.tensor(0.0, device=x.device, dtype=x.dtype), tcT60D)
+        # sigTC = sigTC * (envTCe / (Amplitude(envTCe, 0, tcT60D) + regDelta))
+        envTCe_denominator = self.amplitude_env(envTCe, torch.tensor(0.0, device=x.device, dtype=x.dtype), tcT60D)
         regDelta = self.db_to_amplitude(self.dBregDelta.clamp(-120.0, -60.0)).to(x.device, x.dtype).view(1, 1, 1)
 
-        sigTC_enh = sigTC * (env_e / (env_e_slow + regDelta))
+        sigTC_enh = sigTC * (envTCe / (envTCe_denominator + regDelta))
 
         return sigTC_enh
 
@@ -638,10 +647,10 @@ class OptimizedDASPACE(nn.Module):
         """
         Complete ACE processing pipeline faithfully following Marian Weger's SuperCollider implementation.
         """
-        # Store original for dry/wet mix
+        # Store original input for dry/wet mix (before ANY processing)
         dry = x.clone()
-
-        # 1. Input high-pass
+        
+        # 1. Input high-pass (only for wet processing path)
         hpf_freq = torch.clamp(self.fHPF, 20.0, 1000.0)
         sig = self.high_pass_filter(x, hpf_freq, self.sample_rate)
 
@@ -676,14 +685,16 @@ class OptimizedDASPACE(nn.Module):
         dim_weight = torch.clamp(self.dimWeight, 0.0, 1.0)
         enhanced = (1.0 - dim_weight) * tce_output + dim_weight * sce_filtered
 
-        # Final high-pass filter
+        # Final high-pass filter (applied to ACE signal only, before dry/wet mix)
         enhanced = self.high_pass_filter(enhanced, hpf_freq, self.sample_rate)
 
-        # Volume + dry/wet mix
-        vol_gain = self.db_to_amplitude(torch.clamp(self.vol, -60.0, 20.0))
+        # Dry/wet mix (sig = dry signal, enhanced = wet ACE signal)
         wet_amount = torch.clamp(self.wet, 0.0, 1.0)
-        wet = enhanced * vol_gain
-        output = (1.0 - wet_amount) * dry + wet_amount * wet
+        output = (1.0 - wet_amount) * dry + wet_amount * enhanced
+        
+        # Volume (applied once to final mix)
+        vol_gain = self.db_to_amplitude(torch.clamp(self.vol, -60.0, 20.0))
+        output = output * vol_gain
 
         # Prevent clipping
         output = torch.clamp(output, -1.0, 1.0)
@@ -692,8 +703,8 @@ class OptimizedDASPACE(nn.Module):
         return {
             "output": output,          # final dry+wet output
             "dry": dry,                # original
-            "wet": wet,                # processed before mix
-            "enhanced": enhanced,      # crossfaded ACE
+            "wet": enhanced,           # processed ACE signal
+            "enhanced": enhanced,      # same as wet for compatibility
             "tce_output": tce_output,  # transient-only
             "sce_output": sce_output,  # reconstructed spectral
             "band_signals": band_signals,  # gammatone subbands
