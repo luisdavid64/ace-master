@@ -15,6 +15,9 @@ SynthDef(\ace_testrec, {|buf=1, inOffset=0, outOffset=0|
 	DiskOut.ar(buf, SoundIn.ar([0,1]+inOffset)++In.ar(0+outOffset,2));
 }).load(s);
 
+SynthDef(\ace_offline, {|buf=1, inOffset=0, outOffset=0|
+	DiskOut.ar(buf, SoundIn.ar([0,1]+inOffset)++In.ar(0+outOffset,2));
+}).load(s);
 
 // ACE Filter real-time
 SynthDef(\ace, {
