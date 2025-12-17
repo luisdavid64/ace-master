@@ -544,7 +544,9 @@ class OptimizedDASPACE(nn.Module):
         # Use the general non-linear envelope with band-wise alpha
         # Flatten B and C so bands become 'channels'
         x_bc = v.view(B * C, K, T)                          # [BC,K,T]
-        alpha_band = alpha.view(K)                          # [K]
+        # alpha_band = alpha.view(K)                          # [K]
+        alpha_band = alpha[0, 0, :, 0]  # [K]
+
 
         env_a_bc = self._nonlinear_envelope(x_bc, alpha_band, mode="attack")
         env_a = env_a_bc.view(B, C, K, T)
@@ -573,12 +575,18 @@ class OptimizedDASPACE(nn.Module):
             channel_data = x[:, ch:ch+1, :]  # [batch, 1, time]
             
             # Apply all filters at once using grouped convolution
-            # Reshape filters for grouped conv: [n_bands, 1, filter_len]
+            # Use causal padding for real-time compatibility (no lookahead)
+            filter_length = filters.shape[-1]
+            causal_padding = filter_length - 1
+            
+            # Pad only on the left (past samples) for causal filtering
+            padded_input = F.pad(channel_data.repeat(1, self.n_bands, 1), (causal_padding, 0))
+            
             filtered = F.conv1d(
-                channel_data.repeat(1, self.n_bands, 1),  # [batch, n_bands, time]
+                padded_input,  # [batch, n_bands, time + padding]
                 filters.view(self.n_bands, 1, -1),  # [n_bands, 1, filter_len]  
                 groups=self.n_bands,
-                padding='same'
+                padding=0  # No additional padding needed
             )  # [batch, n_bands, time]
             
             outputs.append(filtered)
@@ -665,19 +673,21 @@ class OptimizedDASPACE(nn.Module):
 
         # --- 3. Decay prolongation (DP) -----------------------------------------
         # per-band T60(fc)
-        fc = fc.view(1, 1, K, 1)
-        T60cut = torch.clamp(self.t60atCutoff, 0.01, 5.0).to(device)
-        fcut   = torch.clamp(self.dpCutoff, 100.0, self.sample_rate / 2.0).to(device)
-        T60 = torch.where(fc <= fcut, T60cut, T60cut * (fcut / fc))
-        fs = torch.tensor(float(self.sample_rate), device=device, dtype=dtype)
-        ln1000 = torch.log(torch.tensor(1000.0, device=device, dtype=dtype))
-        alpha = torch.exp(-ln1000 / (T60 * fs))               # [1,1,K,1]
+        # fc = fc.view(1, 1, K, 1)
+        # T60cut = torch.clamp(self.t60atCutoff, 0.01, 5.0).to(device)
+        # fcut   = torch.clamp(self.dpCutoff, 100.0, self.sample_rate / 2.0).to(device)
+        # T60 = torch.where(fc <= fcut, T60cut, T60cut * (fcut / fc))
+        # fs = torch.tensor(float(self.sample_rate), device=device, dtype=dtype)
+        # ln1000 = torch.log(torch.tensor(1000.0, device=device, dtype=dtype))
+        # alpha = torch.exp(-ln1000 / (T60 * fs))               # [1,1,K,1]
 
-        # Apply attack/decay envelope pair with residuum (Eq. 11)
-        v = env_ex
-        env_a = self.amplitude_env(v, self.tauAdp, torch.tensor(0.0, device=device, dtype=dtype))
-        env_d = self.amplitude_env(env_a, torch.tensor(0.0, device=device, dtype=dtype), self.tauAdp)
-        env_dp = env_d + (v - env_a)
+        # # Apply attack/decay envelope pair with residuum (Eq. 11)
+        # v = env_ex
+        # env_a = self.amplitude_env(v, self.tauAdp, torch.tensor(0.0, device=device, dtype=dtype))
+        # env_d = self.amplitude_env(env_a, torch.tensor(0.0, device=device, dtype=dtype), self.tauAdp)
+        # env_dp = env_d + (v - env_a)
+        band_centers = self._erb_space(50.0, self.sample_rate / 2.0, K, device, dtype)  # [K]
+        env_dp = self._decay_prolongation(env_ex, band_centers)  # [B,1,K,T]
 
         # --- 4. Short smoothing before applying ratio (SP) -----------------------
         tau_sp_ms = torch.clamp(self.tauSP, 0.5, 20.0)
