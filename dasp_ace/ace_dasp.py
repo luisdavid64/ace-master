@@ -274,39 +274,41 @@ class OptimizedDASPACE(nn.Module):
                         slope: torch.Tensor,
                         gain_db: torch.Tensor) -> torch.Tensor:
         """
-        Differentiable biquad high-shelf filter.
+        Differentiable biquad high-shelf filter using DASP's SOS filtering for numerical stability.
         x: [B, C, T]
         freq, slope, gain_db: scalar tensors (same across batch/channels)
         """
         B, C, T = x.shape
         device, dtype = x.device, x.dtype
 
-        # design biquad coeffs (scalars)
+        # Design biquad coeffs using our proven RBJ implementation
         b0, b1, b2, a1, a2 = self._design_high_shelf(
             freq.to(device=device, dtype=dtype),
             slope.to(device=device, dtype=dtype),
             gain_db.to(device=device, dtype=dtype)
         )
 
-        # flatten batch+channels -> [N, T]
-        N = B * C
-        x_flat = x.reshape(N, T)
-
-        # DF-II Transposed
-        y_flat = torch.zeros_like(x_flat)
-        z1 = torch.zeros(N, device=device, dtype=dtype)
-        z2 = torch.zeros(N, device=device, dtype=dtype)
-
-        for n in range(T):
-            xn = x_flat[:, n]
-            yn = b0 * xn + z1
-            z1_new = b1 * xn - a1 * yn + z2
-            z2     = b2 * xn - a2 * yn
-            z1     = z1_new
-            y_flat[:, n] = yn
-
-        y = y_flat.view(B, C, T)
-        return y
+        # Convert to SOS format: [b0, b1, b2, 1, a1, a2] for each section
+        # For a single biquad, we have 1 section with shape [B, 1, 6]
+        sos = torch.stack([
+            b0, b1, b2, 
+            torch.tensor(1.0, device=device, dtype=dtype), a1, a2
+        ]).unsqueeze(0).unsqueeze(0)  # [1, 1, 6]
+        
+        # Expand for all batches
+        sos = sos.expand(B, 1, 6)  # [B, 1, 6]
+        
+        # Apply SOS filter using DASP's optimized implementation  
+        # sosfilt_via_fsm expects [B, C, T] and sos [B, n_sections, 6]
+        x_reshaped = x.reshape(B * C, T)  # Flatten to [B*C, T]
+        sos_expanded = sos.repeat(C, 1, 1)  # [B*C, 1, 6]
+        
+        filtered = dasp_signal.sosfilt_via_fsm(sos_expanded, x_reshaped)
+        
+        # Reshape back to [B, C, T]
+        filtered_x = filtered.reshape(B, C, T)
+        
+        return filtered_x
 
     
     def db_to_amplitude(self, db: torch.Tensor) -> torch.Tensor:
