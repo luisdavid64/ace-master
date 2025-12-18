@@ -40,51 +40,59 @@ class OptimizedDASPACE(nn.Module):
             duration=filter_duration
         )
         
-        # SUPERCOLLIDER-STYLE NORMALIZATION: Match CGammatone coefficient-based approach
-        # This mimics SuperCollider's: normalisation = 2.0*(pow(1-fabs(lambda),4))
-        import math
+        # SUPERCOLLIDER CGAMMATONE IIR COEFFICIENTS (this is the key for resonance!)
+        # Compute exactly like SC C++ code for true resonant behavior
+        print("Computing SuperCollider CGammatone IIR coefficients...")
         
+        fc = self._erb_space(50.0, sample_rate / 2.0, n_bands, torch.device('cpu'), torch.float32)
+        bw = fc * 0.108  # SuperCollider bandwidth relationship
+        
+        # SuperCollider CGammatone constants (from C++ code)
+        beta = 2 * math.pi * fc / sample_rate
+        phi = math.pi * bw / sample_rate
+        p = (1.5886564694486 * torch.cos(phi) - 2) * 4.8621160938616  # 4 dB, order 4
+        lambda_coeff = (p * -0.5) - torch.sqrt(p * p * 0.25 - 1)
+        
+        # Complex pole locations
+        reala = lambda_coeff * torch.cos(beta)  # [K]
+        imaga = lambda_coeff * torch.sin(beta)  # [K]
+        
+        # SuperCollider normalization: 2*(1-abs(lambda))^4
+        normalisation = 2 * torch.pow(1 - torch.abs(lambda_coeff), 4)  # [K]
+        
+        # Register as buffers for device movement
+        self.register_buffer('fc', fc)
+        self.register_buffer('bw', bw) 
+        self.register_buffer('cgamma_reala', reala)
+        self.register_buffer('cgamma_imaga', imaga)
+        self.register_buffer('cgamma_norm', normalisation)
+        
+        print(f"CGammatone coefficients computed for {n_bands} bands")
+        print(f"Frequency range: {fc[0]:.1f}Hz - {fc[-1]:.1f}Hz")
+        
+        # Legacy DASP filterbank kept for compatibility but not used 
+        # (replaced by true IIR CGammatone)
+        raw_filterbank = dasp_signal.gammatone_filterbank(
+            sample_rate=int(sample_rate),
+            num_bands=n_bands,
+            low_freq=50.0,
+            high_freq=sample_rate // 2,
+            order=4,
+            duration=0.02  # Not used in IIR mode
+        )
+        
+        # Apply coefficient-based normalization to legacy filterbank
         with torch.no_grad():
             print("Applying SuperCollider-style coefficient-based normalization...")
-            
-            # Get center frequencies for each band (matching DASP's ERB spacing)
-            low_freq = 50.0
-            high_freq = sample_rate // 2
-            
-            # Calculate ERB-spaced center frequencies (matching DASP)
-            freqs = []
-            erb_low = self._freq_to_erb(low_freq)
-            erb_high = self._freq_to_erb(high_freq)
-            erb_points = torch.linspace(erb_low, erb_high, n_bands)
-            
-            for erb in erb_points:
-                freq = self._erb_to_freq(erb)
-                freqs.append(freq.item())
-            
-            # Apply SuperCollider normalization per band
-            sampling_period = 1.0 / sample_rate
-            
-            for i, center_freq in enumerate(freqs):
-                # SuperCollider bandwidth calculation (ERB-based)
-                erb_bandwidth = 24.7 * (4.37 * center_freq / 1000.0 + 1.0)
-                
-                # SuperCollider's coefficient calculation
-                phi = math.pi * erb_bandwidth * sampling_period
-                # For 4dB attenuation and order 4 (from SuperCollider code)
-                p = (1.5886564694486 * math.cos(phi) - 2) * 4.8621160938616
-                lambda_val = (p * (-0.5)) - math.sqrt(p*p*0.25 - 1.0)
-                
-                # SuperCollider's normalization: 2.0*(1-|lambda|)^4
-                sc_normalization = 2.0 * pow(1 - abs(lambda_val), 4)
-                
-                # Apply to this band's filter
+            # Use the same coefficients we computed above
+            for i in range(n_bands):
+                sc_normalization = normalisation[i].item()
                 raw_filterbank[i] *= sc_normalization
             
             print(f"Applied SuperCollider coefficient normalization to {n_bands} bands")
         
         self.filterbank = raw_filterbank
-        
-        print(f"SuperCollider-style filterbank normalization applied")
+        print("SuperCollider-style filterbank normalization applied")
         
         # All SuperCollider ACE parameters as learnable parameters
         # Core filter parameters
@@ -146,22 +154,32 @@ class OptimizedDASPACE(nn.Module):
 
     def _time_constant_to_alpha_T60(self, tau_ms: torch.Tensor) -> torch.Tensor:
         """
-        Match SuperCollider's mapping:
-        logk = log(1000)/1000
-        T60  = tau_ms * logk  (seconds)
-        alpha = exp(-ln(1000) / (T60 * fs))
-
-        Result: same effective behavior as Amplitude.ar with T60 = tau_ms*logk.
+        Convert time constant in ms to smoothing alpha using SuperCollider's EXACT formula.
+        CRITICAL FIX: This was killing tails! Now matches SC exactly.
+        
+        SuperCollider does:
+        logk = log(1000)/1000;
+        T60_seconds = tau_ms * logk;   // tau is in ms, result is seconds 
+        alpha = exp(-log(1000)/(T60_seconds * fs));
         """
         fs = torch.tensor(float(self.sample_rate), device=tau_ms.device, dtype=tau_ms.dtype)
         ln1000 = torch.log(torch.tensor(1000.0, device=tau_ms.device, dtype=tau_ms.dtype))
-        logk = ln1000 / 1000.0
-
-        tau_ms = torch.clamp(tau_ms, 0.1, 1000.0)
-        T60 = tau_ms * logk / 1000.0   # seconds
-
-        alpha = torch.exp(-ln1000 / (T60 * fs))
+        logk = ln1000 / 1000.0  # SuperCollider's logk
+        
+        # SuperCollider "instant": if tau_ms <= 0 -> alpha=0 (instant)
+        alpha = torch.zeros_like(tau_ms)
+        pos = tau_ms > 0
+        if pos.any():
+            T60 = tau_ms[pos] * logk  # seconds (IMPORTANT: no extra /1000 here!)
+            alpha[pos] = torch.exp(-ln1000 / (T60 * fs))
         return alpha
+
+    def _get_frequency_signs(self, n_bands, device):
+        """Get frequency-dependent phase signs for real reconstruction"""
+        # Simple alternating pattern to preserve phase relationships
+        signs = torch.ones(1, 1, n_bands, 1, device=device)
+        signs[:, :, 1::2, :] = -1  # Alternate signs for odd bands
+        return signs
 
  
     def _nonlinear_envelope(self, x: torch.Tensor, alpha: torch.Tensor, mode: str) -> torch.Tensor:
@@ -561,61 +579,65 @@ class OptimizedDASPACE(nn.Module):
         p = env_d + resid
         return p
 
+    def cgammatone_iir(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        SuperCollider CGammatone IIR filtering - THE KEY to ACE resonance!
+        This replaces the truncated FIR gammatone with true ringing IIR filters.
+        
+        x: [B, C, T] real input
+        returns: (real, imag) each [B, C, K, T]
+        """
+        B, C, T = x.shape
+        K = self.n_bands
+        device, dtype = x.device, x.dtype
+        
+        # Get coefficients on correct device
+        reala = self.cgamma_reala.to(device=device, dtype=dtype).view(1, 1, K)  # [1,1,K]
+        imaga = self.cgamma_imaga.to(device=device, dtype=dtype).view(1, 1, K)
+        norm = self.cgamma_norm.to(device=device, dtype=dtype).view(1, 1, K)
+        
+        # IIR states: [B, C, K, 4] for 4 cascaded complex one-poles
+        oldreal = torch.zeros(B, C, K, 4, device=device, dtype=dtype)
+        oldimag = torch.zeros(B, C, K, 4, device=device, dtype=dtype)
+        
+        # Output buffers
+        outR = torch.empty(B, C, K, T, device=device, dtype=dtype)
+        outI = torch.empty(B, C, K, T, device=device, dtype=dtype)
+        
+        # Time loop (IIR unavoidable, but vectorized over bands)
+        for t in range(T):
+            xt = x[..., t].unsqueeze(-1)  # [B,C,1]
+            newreal = xt.expand(B, C, K)  # [B,C,K]
+            newimag = torch.zeros_like(newreal)
+            
+            # 4 cascaded complex one-poles (exactly like SuperCollider)
+            for j in range(4):
+                orj = oldreal[..., j]  # [B,C,K]
+                oij = oldimag[..., j]
+                
+                # Complex multiplication: (newreal + j*newimag) * (reala + j*imaga)
+                nr = newreal + (reala * orj) - (imaga * oij)
+                ni = newimag + (reala * oij) + (imaga * orj)
+                
+                newreal, newimag = nr, ni
+                oldreal[..., j] = newreal
+                oldimag[..., j] = newimag
+            
+            # Apply normalization and store
+            outR[..., t] = newreal * norm
+            outI[..., t] = newimag * norm
+        
+        return outR, outI
     
     def apply_gammatone_filterbank(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Complex gammatone filtering like SuperCollider CGammatone
-        Returns (real_parts, imag_parts) to match: ck = CGammatone.ar(item, fcs, bws).flop
+        Apply SuperCollider-style CGammatone IIR filtering for true resonance.
+        Returns (ck_real, ck_imag) exactly like SuperCollider's CGammatone.ar().flop
         """
-        batch_size, n_channels, n_samples = x.shape
+        # Use true IIR CGammatone (the key to resonance!)
+        ck_real, ck_imag = self.cgammatone_iir(x)
         
-        # Move filterbank to device
-        filters = self.filterbank.to(x.device)
-        
-        # Apply filtering efficiently to get real parts
-        real_outputs = []
-        for ch in range(n_channels):
-            channel_data = x[:, ch:ch+1, :]  # [batch, 1, time]
-            
-            # Apply all filters at once using grouped convolution
-            # Use causal padding for real-time compatibility (no lookahead)
-            filter_length = filters.shape[-1]
-            causal_padding = filter_length - 1
-            
-            # Pad only on the left (past samples) for causal filtering
-            padded_input = F.pad(channel_data.repeat(1, self.n_bands, 1), (causal_padding, 0))
-            
-            filtered = F.conv1d(
-                padded_input,  # [batch, n_bands, time + padding]
-                filters.view(self.n_bands, 1, -1),  # [n_bands, 1, filter_len]  
-                groups=self.n_bands,
-                padding=0  # No additional padding needed
-            )  # [batch, n_bands, time]
-            
-            real_outputs.append(filtered)
-        
-        # Stack real parts: [batch, channels, bands, time]
-        real_parts = torch.stack(real_outputs, dim=1)
-        
-        # Generate imaginary parts using Hilbert transform (approximation)
-        # SuperCollider CGammatone provides both real and imaginary components
-        # This creates the analytic signal for complex envelope detection
-        imag_parts = torch.zeros_like(real_parts)
-        
-        # Simple Hilbert approximation: 90-degree phase shift
-        # For each band, create imaginary part by delaying and sign-flipping
-        delay_samples = 1  # Minimal delay for 90-degree approximation
-        for b in range(batch_size):
-            for c in range(n_channels): 
-                for k in range(self.n_bands):
-                    signal = real_parts[b, c, k, :]
-                    # Simple 90-degree phase shift approximation
-                    shifted = torch.roll(signal, delay_samples)
-                    shifted[:delay_samples] = 0  # Zero out wrapped samples
-                    # Alternate sign for imaginary part to create proper phase relationship
-                    imag_parts[b, c, k, :] = shifted * (1 if k % 2 == 0 else -1)
-        
-        return real_parts, imag_parts
+        return ck_real, ck_imag
     
     def envelope_follower_with_times(self, x: torch.Tensor, attack_time: float = 0.01, decay_time: float = 0.1) -> torch.Tensor:
         """
@@ -726,19 +748,10 @@ class OptimizedDASPACE(nn.Module):
         return c_out
  
     
-    def _get_frequency_signs(self, n_bands: int, device: torch.device) -> torch.Tensor:
-        """Get alternating frequency signs for phase coherence (SuperCollider approach)"""
-        signs = torch.ones(n_bands, device=device, dtype=torch.float32)
-        signs[1::2] = -1  # Alternate signs: +1, -1, +1, -1, ...
-        return signs.view(1, 1, n_bands, 1)  # [1, 1, K, 1] for broadcasting
-
     def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
         """
         Complete ACE processing pipeline faithfully following Marian Weger's SuperCollider implementation.
         """
-        # Extract tensor dimensions
-        B, C, T = x.shape  # batch, channels, time
-        
         # Store original input for dry/wet mix (before ANY processing)
         dry = x.clone()
         
@@ -760,16 +773,17 @@ class OptimizedDASPACE(nn.Module):
         noise_amp = self.db_to_amplitude(self.dbNoise.clamp(-120.0, -60.0))
         sigSC_noisy = sigSC + noise_amp * torch.randn_like(sigSC)
 
-        # Apply COMPLEX gammatone filterbank (like SuperCollider CGammatone)
+        # Apply COMPLEX gammatone filterbank (SuperCollider CGammatone IIR)
         # ck = sigSC.collect{|item,i| CGammatone.ar(item, fcs, bws).flop}
         ck_real, ck_imag = self.apply_gammatone_filterbank(sigSC_noisy)  # [B, C, K, T] each
+        B, C, K, T = ck_real.shape  # Extract dimensions
         
         # SuperCollider: env = ck.sum.madd(0.5).squared.sum.sqrt.clip(0,1)
         # This means: sum channels, multiply by 0.5, then envelope = sqrt(Re² + Im²)
         ck_sum_real = ck_real.sum(dim=1) * 0.5  # [B, K, T] - sum over channels
         ck_sum_imag = ck_imag.sum(dim=1) * 0.5  # [B, K, T] - sum over channels
         
-        # Complex envelope: sqrt(Re² + Im²) for each band
+        # Complex envelope: sqrt(Re² + Im²) for each band  
         complex_envelope = torch.sqrt(ck_sum_real.pow(2) + ck_sum_imag.pow(2) + 1e-12)  # [B, K, T]
         
         # Apply SCE processing to the complex envelope (LI + EX + DP + SP)
@@ -777,13 +791,13 @@ class OptimizedDASPACE(nn.Module):
         sce_env = self.spectral_contrast_enhancement(complex_envelope.unsqueeze(1))  # [B, 1, K, T]
         sce_env = sce_env.squeeze(1)  # [B, K, T]
         
+        # Calculate original envelope for normalization (env0)
+        env0 = torch.sqrt(ck_real.pow(2) + ck_imag.pow(2) + 1e-12)  # [B, C, K, T]
+        
         # Reconstruct using REAL PARTS with processed envelope (like SuperCollider)
         # sigACE = ( ck[i][0] * fSigns  * env * bandWeights / (env0[i] + regDelta) ).sum
         freq_signs = self._get_frequency_signs(self.n_bands, ck_real.device)  # [1, 1, K, 1]
         regDelta = self.db_to_amplitude(self.dBregDelta.clamp(-120.0, -60.0))
-        
-        # Calculate original envelope for normalization (env0)
-        env0 = torch.sqrt(ck_real.pow(2) + ck_imag.pow(2) + 1e-12)  # [B, C, K, T]
         
         # Reconstruct for each channel using real parts only
         sce_outputs = []
@@ -825,7 +839,7 @@ class OptimizedDASPACE(nn.Module):
             "wet": enhanced,           # processed ACE signal
             "enhanced": enhanced,      # same as wet for compatibility
             "tce": tce_output,         # transient-only
-            "sce": sce_output,         # reconstructed spectral  
+            "sce": sce_output,         # reconstructed spectral
             "real_parts": ck_real,     # complex gammatone real parts
             "imag_parts": ck_imag,     # complex gammatone imaginary parts
             "complex_envelope": complex_envelope,  # sqrt(Re² + Im²)
