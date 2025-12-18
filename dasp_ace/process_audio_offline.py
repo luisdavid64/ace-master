@@ -23,6 +23,31 @@ except ImportError as e:
     print("Make sure ace_dasp_optimized.py is in the same directory")
     sys.exit(1)
 
+def safe_save_wav(path: str, audio: torch.Tensor, sr: int, peak_target: float = 0.95):
+    """
+    audio: [C, T] float tensor
+    - checks NaN/Inf
+    - peak-normalizes if needed (no clipping)
+    - writes explicit PCM 16-bit
+    """
+    audio = audio.detach().cpu().float()
+
+    # Safety: kill NaN/Inf (these can create nasty crackles on save/playback)
+    if not torch.isfinite(audio).all():
+        audio = torch.nan_to_num(audio, nan=0.0, posinf=0.0, neginf=0.0)
+
+    peak = audio.abs().max().clamp_min(1e-8).item()
+    if peak > peak_target:
+        audio = audio * (peak_target / peak)
+
+    torchaudio.save(
+        path,
+        audio,
+        sr,
+        encoding="PCM_S",
+        bits_per_sample=16
+    )
+
 
 def calculate_snr_metrics(original: torch.Tensor, enhanced: torch.Tensor, noise_ref: torch.Tensor = None) -> dict:
     """
@@ -117,7 +142,7 @@ def calculate_snr_metrics(original: torch.Tensor, enhanced: torch.Tensor, noise_
         snr_metrics['original_snr_absolute_db'] = 10 * torch.log10(original_snr_abs + eps).item()
         snr_metrics['enhanced_snr_absolute_db'] = 10 * torch.log10(enhanced_snr_abs + eps).item()
         snr_metrics['snr_improvement_db'] = snr_metrics['enhanced_snr_absolute_db'] - snr_metrics['original_snr_absolute_db']
-    
+
     return snr_metrics
 
 
@@ -217,7 +242,9 @@ def process_audio_file(input_path: str,
         os.makedirs(output_dir, exist_ok=True)
     
     try:
-        torchaudio.save(output_path, enhanced_audio, sample_rate)
+        # torchaudio.save(output_path, enhanced_audio, sample_rate)
+        safe_save_wav(output_path, enhanced_audio, sample_rate)
+
         print("✓ Audio saved successfully")
     except Exception as e:
         print(f"✗ Failed to save audio: {e}")
